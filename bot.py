@@ -122,20 +122,7 @@ def get_chat_id(update: Update) -> int:
 
 def ensure_session(chat_id: int):
     if chat_id not in sessions:
-        sessions[chat_id] = {
-            "state": STATE_IDLE,
-            "name": None,
-            "login_id": None,
-            "password": None,
-            "pending_name": None,
-            "pending_login_id": None,
-            "pending_password": None,
-            "playwright": None,
-            "browser": None,
-            "context": None,
-            "page": None,
-            "logged_in": False,
-        }
+        reset_session_data(chat_id)
 
 
 def reset_session_data(chat_id: int):
@@ -240,7 +227,6 @@ def decrypt_password(token: str) -> str:
 def add_saved_login(name: str, login_id: str, password: str):
     items = load_saved_logins()
 
-    # Same login ID already exists, update it
     for item in items:
         if item.get("login_id") == login_id:
             item["name"] = name
@@ -262,6 +248,7 @@ def add_saved_login(name: str, login_id: str, password: str):
 
 def delete_saved_login_by_index(index: int):
     items = load_saved_logins()
+
     if index < 0 or index >= len(items):
         return None
 
@@ -361,10 +348,6 @@ async def launch_browser_and_page():
 
 
 async def take_captcha_crop(page, chat_id: int) -> Path:
-    """
-    Sirf captcha area ka screenshot.
-    Crop fail hua toh full screenshot fallback.
-    """
     captcha_path = SCREENSHOT_DIR / f"captcha_{chat_id}.png"
 
     captcha_box = None
@@ -907,11 +890,17 @@ async def screenshot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- CALLBACK HANDLER ----------------
 
 async def saved_login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update):
-        await update.callback_query.answer("Access denied.", show_alert=True)
+    query = update.callback_query
+
+    if not query:
         return
 
-    query = update.callback_query
+    print("CALLBACK RECEIVED:", query.data, flush=True)
+
+    if not is_allowed(update):
+        await query.answer("Access denied.", show_alert=True)
+        return
+
     await query.answer()
 
     chat_id = get_chat_id(update)
@@ -999,7 +988,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = sessions[chat_id]
     state = session.get("state", STATE_IDLE)
 
-    # Main buttons
     if text == "🔐 New Login":
         await start_new_login(update, context)
         return
@@ -1033,7 +1021,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_flow(update, context)
         return
 
-    # Waiting for Name + ID + Password
     if state == STATE_WAITING_CREDENTIALS:
         name, login_id, password = parse_name_id_password(text)
 
@@ -1094,7 +1081,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Save/Login choice
     if state == STATE_WAITING_SAVE_CHOICE:
         name = session.get("pending_name")
         login_id = session.get("pending_login_id")
@@ -1146,7 +1132,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Captcha
     if state == STATE_WAITING_CAPTCHA:
         captcha_answer = text
 
@@ -1192,7 +1177,7 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("Bot error:", context.error)
+    print("Bot error:", context.error, flush=True)
 
 
 def main():
@@ -1210,18 +1195,14 @@ def main():
     app.add_handler(CommandHandler("screenshot", screenshot_command))
     app.add_handler(CommandHandler("close", close_command))
 
-    app.add_handler(
-        CallbackQueryHandler(
-            saved_login_callback,
-            pattern=r"^(login_saved:|delete_saved:|saved_cancel$)"
-        )
-    )
+    # IMPORTANT: no pattern, so every inline button callback reaches handler
+    app.add_handler(CallbackQueryHandler(saved_login_callback))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
     app.add_error_handler(error_handler)
 
-    print("Jhatpat button Telegram bot running...")
+    print("Jhatpat button Telegram bot running...", flush=True)
     app.run_polling()
 
 
