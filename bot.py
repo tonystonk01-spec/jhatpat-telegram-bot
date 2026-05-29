@@ -11,15 +11,12 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -75,6 +72,7 @@ def cancel_keyboard():
         [[KeyboardButton("❌ Cancel")]],
         resize_keyboard=True,
         one_time_keyboard=False,
+        input_field_placeholder="Cancel?"
     )
 
 
@@ -87,27 +85,33 @@ def save_choice_keyboard():
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
+        input_field_placeholder="Choose save option..."
     )
 
 
-def saved_logins_inline_keyboard(delete_mode=False):
+def saved_login_keyboard(delete_mode=False):
     items = load_saved_logins()
     rows = []
 
-    for i, item in enumerate(items):
+    for i, item in enumerate(items, start=1):
         name = item.get("name", "Unknown")
         login_id = item.get("login_id", "")
-        label = f"{name} ({mask_text(login_id)})"
 
         if delete_mode:
-            callback_data = f"delete_saved:{i}"
+            text = f"🗑 {i}. {name} ({mask_text(login_id)})"
         else:
-            callback_data = f"login_saved:{i}"
+            text = f"👤 {i}. {name} ({mask_text(login_id)})"
 
-        rows.append([InlineKeyboardButton(label, callback_data=callback_data)])
+        rows.append([KeyboardButton(text)])
 
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="saved_cancel")])
-    return InlineKeyboardMarkup(rows)
+    rows.append([KeyboardButton("❌ Cancel")])
+
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Choose saved login..."
+    )
 
 
 # ---------------- BASIC HELPERS ----------------
@@ -422,7 +426,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Example:\n"
         "<code>Ramesh ji 7302405466 mypassword</code>\n\n"
         "📂 <b>Saved Logins:</b>\n"
-        "Saved customer ke naam par tap karo, login direct start ho jayega.\n\n"
+        "Saved customer ke naam wale button par tap karo.\n\n"
         "🧩 Captcha ke time sirf answer bhejna hai.\n"
         "Example: <code>16</code>",
         main_keyboard(),
@@ -500,11 +504,11 @@ async def show_saved_logins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.effective_message.reply_text(
+    await send_text(
+        update,
         "📂 <b>Saved Logins</b>\n\n"
-        "Customer name par tap karo, login direct start ho jayega 👇",
-        parse_mode=ParseMode.HTML,
-        reply_markup=saved_logins_inline_keyboard(delete_mode=False),
+        "Customer button par tap karo, login direct start ho jayega 👇",
+        saved_login_keyboard(delete_mode=False),
     )
 
 
@@ -519,11 +523,11 @@ async def show_delete_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.effective_message.reply_text(
+    await send_text(
+        update,
         "🗑 <b>Delete Saved Login</b>\n\n"
-        "Jise delete karna hai us naam par tap karo 👇",
-        parse_mode=ParseMode.HTML,
-        reply_markup=saved_logins_inline_keyboard(delete_mode=True),
+        "Jise delete karna hai us button par tap karo 👇",
+        saved_login_keyboard(delete_mode=True),
     )
 
 
@@ -887,90 +891,6 @@ async def screenshot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ---------------- CALLBACK HANDLER ----------------
-
-async def saved_login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-
-    if not query:
-        return
-
-    print("CALLBACK RECEIVED:", query.data, flush=True)
-
-    if not is_allowed(update):
-        await query.answer("Access denied.", show_alert=True)
-        return
-
-    await query.answer()
-
-    chat_id = get_chat_id(update)
-    ensure_session(chat_id)
-
-    data = query.data or ""
-
-    if data == "saved_cancel":
-        await query.edit_message_text("❌ Cancelled.")
-        await send_text(update, "Back to main menu.", main_keyboard())
-        return
-
-    if data.startswith("login_saved:"):
-        index_text = data.split(":", 1)[1]
-
-        if not index_text.isdigit():
-            await query.edit_message_text("❌ Invalid saved login.")
-            return
-
-        index = int(index_text)
-        items = load_saved_logins()
-
-        if index < 0 or index >= len(items):
-            await query.edit_message_text("❌ Invalid saved login.")
-            return
-
-        await close_browser_session(chat_id)
-        ensure_session(chat_id)
-
-        item = items[index]
-
-        try:
-            name = item.get("name", "Customer")
-            login_id = item["login_id"]
-            password = decrypt_password(item["password"])
-        except Exception:
-            await query.edit_message_text("❌ Saved login decrypt nahi hua. Delete karke dobara save karo.")
-            return
-
-        sessions[chat_id]["name"] = name
-        sessions[chat_id]["login_id"] = login_id
-        sessions[chat_id]["password"] = password
-        sessions[chat_id]["state"] = STATE_IDLE
-
-        await query.edit_message_text(
-            f"✅ Selected: {name}\nOpening portal now..."
-        )
-
-        await open_site_and_send_captcha(update, context)
-        return
-
-    if data.startswith("delete_saved:"):
-        index_text = data.split(":", 1)[1]
-
-        if not index_text.isdigit():
-            await query.edit_message_text("❌ Invalid saved login.")
-            return
-
-        index = int(index_text)
-        deleted = delete_saved_login_by_index(index)
-
-        if deleted:
-            name = deleted.get("name", "Unknown")
-            await query.edit_message_text(f"🗑 Deleted: {name}")
-            await send_text(update, "Back to main menu.", main_keyboard())
-        else:
-            await query.edit_message_text("❌ Delete failed.")
-        return
-
-
 # ---------------- MESSAGE ROUTER ----------------
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -988,6 +908,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = sessions[chat_id]
     state = session.get("state", STATE_IDLE)
 
+    # Main buttons
     if text == "🔐 New Login":
         await start_new_login(update, context)
         return
@@ -1021,6 +942,77 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_flow(update, context)
         return
 
+    # Saved login normal keyboard button
+    if text.startswith("👤 "):
+        match = re.match(r"👤\s+(\d+)\.", text)
+
+        if not match:
+            await send_text(update, "⚠️ Saved login button invalid.", main_keyboard())
+            return
+
+        index = int(match.group(1)) - 1
+        items = load_saved_logins()
+
+        if index < 0 or index >= len(items):
+            await send_text(update, "⚠️ Saved login not found.", main_keyboard())
+            return
+
+        await close_browser_session(chat_id)
+        ensure_session(chat_id)
+
+        item = items[index]
+
+        try:
+            name = item.get("name", "Customer")
+            login_id = item["login_id"]
+            password = decrypt_password(item["password"])
+        except Exception:
+            await send_text(
+                update,
+                "❌ Saved password decrypt nahi hua. Delete karke dobara save karo.",
+                main_keyboard(),
+            )
+            return
+
+        sessions[chat_id]["name"] = name
+        sessions[chat_id]["login_id"] = login_id
+        sessions[chat_id]["password"] = password
+        sessions[chat_id]["state"] = STATE_IDLE
+
+        await send_text(
+            update,
+            f"✅ Selected: <b>{html_escape(name)}</b>\n\n"
+            "Opening portal now...",
+            cancel_keyboard(),
+        )
+
+        await open_site_and_send_captcha(update, context)
+        return
+
+    # Delete saved normal keyboard button
+    if text.startswith("🗑 "):
+        match = re.match(r"🗑\s+(\d+)\.", text)
+
+        if not match:
+            await send_text(update, "⚠️ Delete button invalid.", main_keyboard())
+            return
+
+        index = int(match.group(1)) - 1
+        deleted = delete_saved_login_by_index(index)
+
+        if deleted:
+            name = deleted.get("name", "Unknown")
+            await send_text(
+                update,
+                f"🗑 <b>Deleted:</b> {html_escape(name)}",
+                main_keyboard(),
+            )
+        else:
+            await send_text(update, "⚠️ Saved login not found.", main_keyboard())
+
+        return
+
+    # Waiting for Name + ID + Password
     if state == STATE_WAITING_CREDENTIALS:
         name, login_id, password = parse_name_id_password(text)
 
@@ -1081,6 +1073,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Save/Login choice
     if state == STATE_WAITING_SAVE_CHOICE:
         name = session.get("pending_name")
         login_id = session.get("pending_login_id")
@@ -1132,6 +1125,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Captcha
     if state == STATE_WAITING_CAPTCHA:
         captcha_answer = text
 
@@ -1194,9 +1188,6 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("screenshot", screenshot_command))
     app.add_handler(CommandHandler("close", close_command))
-
-    # IMPORTANT: no pattern, so every inline button callback reaches handler
-    app.add_handler(CallbackQueryHandler(saved_login_callback))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
