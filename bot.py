@@ -300,20 +300,45 @@ async def safe_goto(page, url: str):
 
 
 async def is_dashboard_visible(page) -> bool:
+    """
+    Strong dashboard check.
+    Jhatpat site sometimes loads dashboard but browser load state still times out.
+    """
+    await page.wait_for_timeout(3000)
+
     checks = [
         "text=Dashboard",
         "text=List of Previously Applied Applications",
         "text=Apply for New Connection",
-        "text=View Details",
         "text=Application No",
+        "text=Applicant Name",
+        "text=View Details",
+        "text=Next Required Step",
+        "text=Pending at which side",
     ]
 
     for selector in checks:
         try:
-            if await page.locator(selector).first.is_visible(timeout=3000):
+            if await page.locator(selector).first.is_visible(timeout=5000):
                 return True
         except Exception:
             pass
+
+    try:
+        body_text = await page.locator("body").inner_text(timeout=5000)
+        body_text_lower = body_text.lower()
+
+        if (
+            "dashboard" in body_text_lower
+            or "previously applied applications" in body_text_lower
+            or "application no" in body_text_lower
+            or "apply for new connection" in body_text_lower
+            or "applicant name" in body_text_lower
+            or "view details" in body_text_lower
+        ):
+            return True
+    except Exception:
+        pass
 
     return False
 
@@ -769,14 +794,14 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
         if not clicked_login:
             raise RuntimeError("Login button not found/clickable.")
 
-        await progress_msg.edit_text("⏳ Waiting after login...", parse_mode=ParseMode.HTML)
+        await progress_msg.edit_text("⏳ Checking login result...", parse_mode=ParseMode.HTML)
 
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=45000)
-        except PlaywrightTimeoutError:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
             pass
 
-        await page.wait_for_timeout(7000)
+        await page.wait_for_timeout(8000)
 
         after_login_path = SCREENSHOT_DIR / f"after_login_{chat_id}.png"
         await page.screenshot(path=str(after_login_path), full_page=True)
@@ -795,8 +820,8 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
             caption = (
                 f"✅ <b>Login successful.</b>\n\n"
                 f"👤 <b>{html_escape(name)}</b>\n\n"
-                "📸 Screenshot button se current page dekh sakte ho.\n"
-                "🛑 Close Session se browser close kar sakte ho."
+                "Dashboard open ho gaya.\n"
+                "📸 Screenshot button se current page dekh sakte ho."
             )
         else:
             await progress_msg.edit_text("⚠️ Screenshot ready.", parse_mode=ParseMode.HTML)
@@ -816,8 +841,11 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
 
     except Exception as e:
         try:
+            await page.wait_for_timeout(3000)
+
             after_login_path = SCREENSHOT_DIR / f"after_login_errorcheck_{chat_id}.png"
             await page.screenshot(path=str(after_login_path), full_page=True)
+
             dashboard_ok = await is_dashboard_visible(page)
 
             if dashboard_ok:
@@ -826,11 +854,17 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
                 session["password"] = None
                 session["pending_password"] = None
 
+                name = session.get("name") or "Customer"
+
                 await progress_msg.edit_text("✅ Login completed.", parse_mode=ParseMode.HTML)
 
                 await update.effective_message.reply_photo(
                     photo=open(after_login_path, "rb"),
-                    caption="✅ <b>Login successful.</b>\n\nDashboard open ho gaya.",
+                    caption=(
+                        f"✅ <b>Login successful.</b>\n\n"
+                        f"👤 <b>{html_escape(name)}</b>\n\n"
+                        "Dashboard open ho gaya."
+                    ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=main_keyboard(),
                 )
