@@ -11,12 +11,15 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -48,8 +51,6 @@ sessions = {}
 STATE_IDLE = "idle"
 STATE_WAITING_CREDENTIALS = "waiting_credentials"
 STATE_WAITING_SAVE_CHOICE = "waiting_save_choice"
-STATE_WAITING_SAVED_CHOICE = "waiting_saved_choice"
-STATE_WAITING_DELETE_CHOICE = "waiting_delete_choice"
 STATE_WAITING_CAPTCHA = "waiting_captcha"
 
 
@@ -89,6 +90,26 @@ def save_choice_keyboard():
     )
 
 
+def saved_logins_inline_keyboard(delete_mode=False):
+    items = load_saved_logins()
+    rows = []
+
+    for i, item in enumerate(items):
+        name = item.get("name", "Unknown")
+        login_id = item.get("login_id", "")
+        label = f"{name} ({mask_text(login_id)})"
+
+        if delete_mode:
+            callback_data = f"delete_saved:{i}"
+        else:
+            callback_data = f"login_saved:{i}"
+
+        rows.append([InlineKeyboardButton(label, callback_data=callback_data)])
+
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="saved_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ---------------- BASIC HELPERS ----------------
 
 def is_allowed(update: Update) -> bool:
@@ -117,6 +138,23 @@ def ensure_session(chat_id: int):
         }
 
 
+def reset_session_data(chat_id: int):
+    sessions[chat_id] = {
+        "state": STATE_IDLE,
+        "name": None,
+        "login_id": None,
+        "password": None,
+        "pending_name": None,
+        "pending_login_id": None,
+        "pending_password": None,
+        "playwright": None,
+        "browser": None,
+        "context": None,
+        "page": None,
+        "logged_in": False,
+    }
+
+
 def mask_text(text: str) -> str:
     if not text:
         return "N/A"
@@ -135,7 +173,7 @@ def html_escape(text: str) -> str:
 
 
 async def send_text(update: Update, text: str, keyboard=None):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -148,8 +186,8 @@ def parse_name_id_password(text: str):
     Format:
     Ramesh ji 7302405466 password123
 
-    Last 2 parts are login_id and password.
-    Everything before that is name.
+    Last 2 words = login_id and password.
+    Everything before that = name.
     """
     parts = text.strip().split()
 
@@ -202,7 +240,7 @@ def decrypt_password(token: str) -> str:
 def add_saved_login(name: str, login_id: str, password: str):
     items = load_saved_logins()
 
-    # Same login ID already saved hai toh update
+    # Same login ID already exists, update it
     for item in items:
         if item.get("login_id") == login_id:
             item["name"] = name
@@ -222,42 +260,14 @@ def add_saved_login(name: str, login_id: str, password: str):
     save_saved_logins(items)
 
 
-def delete_saved_login_by_index(index: int) -> bool:
+def delete_saved_login_by_index(index: int):
     items = load_saved_logins()
     if index < 0 or index >= len(items):
-        return False
+        return None
 
-    items.pop(index)
+    deleted = items.pop(index)
     save_saved_logins(items)
-    return True
-
-
-def saved_logins_text(delete_mode=False) -> str:
-    items = load_saved_logins()
-
-    if not items:
-        return "📂 <b>No saved logins found.</b>"
-
-    if delete_mode:
-        lines = ["🗑 <b>Delete Saved Login</b>\n"]
-    else:
-        lines = ["📂 <b>Saved Logins</b>\n"]
-
-    for i, item in enumerate(items, start=1):
-        name = item.get("name", "Unknown")
-        login_id = item.get("login_id", "")
-        lines.append(
-            f"{i}. <b>{html_escape(name)}</b>  —  <code>{mask_text(login_id)}</code>"
-        )
-
-    if delete_mode:
-        lines.append("\nSend number to delete.")
-    else:
-        lines.append("\nSend number to login.")
-
-    lines.append("Example: <code>1</code>")
-
-    return "\n".join(lines)
+    return deleted
 
 
 # ---------------- BROWSER SESSION ----------------
@@ -286,20 +296,7 @@ async def close_browser_session(chat_id: int):
     except Exception:
         pass
 
-    sessions[chat_id] = {
-        "state": STATE_IDLE,
-        "name": None,
-        "login_id": None,
-        "password": None,
-        "pending_name": None,
-        "pending_login_id": None,
-        "pending_password": None,
-        "playwright": None,
-        "browser": None,
-        "context": None,
-        "page": None,
-        "logged_in": False,
-    }
+    reset_session_data(chat_id)
 
 
 async def safe_goto(page, url: str):
@@ -317,6 +314,7 @@ async def is_dashboard_visible(page) -> bool:
         "text=List of Previously Applied Applications",
         "text=Apply for New Connection",
         "text=View Details",
+        "text=Application No",
     ]
 
     for selector in checks:
@@ -364,8 +362,8 @@ async def launch_browser_and_page():
 
 async def take_captcha_crop(page, chat_id: int) -> Path:
     """
-    Full page ki jagah sirf captcha area crop karta hai.
-    Agar crop fail ho toh full screenshot fallback.
+    Sirf captcha area ka screenshot.
+    Crop fail hua toh full screenshot fallback.
     """
     captcha_path = SCREENSHOT_DIR / f"captcha_{chat_id}.png"
 
@@ -384,10 +382,10 @@ async def take_captcha_crop(page, chat_id: int) -> Path:
 
             if box:
                 captcha_box = {
-                    "x": max(box["x"] - 50, 0),
-                    "y": max(box["y"] - 135, 0),
-                    "width": max(box["width"] + 160, 340),
-                    "height": 210,
+                    "x": max(box["x"] - 55, 0),
+                    "y": max(box["y"] - 145, 0),
+                    "width": max(box["width"] + 170, 360),
+                    "height": 230,
                 }
                 break
         except Exception:
@@ -408,7 +406,7 @@ async def take_captcha_crop(page, chat_id: int) -> Path:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     chat_id = get_chat_id(update)
@@ -419,7 +417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ <b>Jhatpat Bot Ready</b>\n\n"
         "Button choose karo 👇\n\n"
         "🔐 <b>New Login</b> - new customer login\n"
-        "📂 <b>Saved Logins</b> - saved customer se login\n"
+        "📂 <b>Saved Logins</b> - saved customer button se login\n"
         "📸 <b>Screenshot</b> - current page image\n"
         "🗑 <b>Delete Saved</b> - saved login remove\n"
         "🛑 <b>Close Session</b> - browser close",
@@ -429,31 +427,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     await send_text(
         update,
         "❔ <b>Help</b>\n\n"
-        "New login flow:\n"
-        "1️⃣ Press <b>🔐 New Login</b>\n"
-        "2️⃣ Send <b>Name LoginID Password</b> in one message\n\n"
+        "🔐 <b>New Login:</b>\n"
+        "Send in this format:\n"
+        "<code>Name LoginID Password</code>\n\n"
         "Example:\n"
         "<code>Ramesh ji 7302405466 mypassword</code>\n\n"
-        "3️⃣ Choose <b>🚀 Login Once</b> or <b>💾 Save & Login</b>\n"
-        "4️⃣ Bot sirf captcha image bhejega\n"
-        "5️⃣ Captcha answer bhej do\n\n"
-        "Saved login flow:\n"
-        "1️⃣ Press <b>📂 Saved Logins</b>\n"
-        "2️⃣ Name ke saamne number select karo\n"
-        "3️⃣ Captcha solve karo",
+        "📂 <b>Saved Logins:</b>\n"
+        "Saved customer ke naam par tap karo, login direct start ho jayega.\n\n"
+        "🧩 Captcha ke time sirf answer bhejna hai.\n"
+        "Example: <code>16</code>",
         main_keyboard(),
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     chat_id = get_chat_id(update)
@@ -464,23 +459,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logged_in = session.get("logged_in", False)
     name = session.get("name")
     login_id = session.get("login_id")
+    saved_count = len(load_saved_logins())
 
     if state == STATE_WAITING_CREDENTIALS:
         state_text = "Waiting for Name + ID + Password"
     elif state == STATE_WAITING_SAVE_CHOICE:
         state_text = "Waiting for Save/Login choice"
-    elif state == STATE_WAITING_SAVED_CHOICE:
-        state_text = "Waiting for saved login selection"
-    elif state == STATE_WAITING_DELETE_CHOICE:
-        state_text = "Waiting for delete selection"
     elif state == STATE_WAITING_CAPTCHA:
         state_text = "Waiting for Captcha"
     elif logged_in:
         state_text = "Logged in / Page active"
     else:
         state_text = "Idle"
-
-    saved_count = len(load_saved_logins())
 
     await send_text(
         update,
@@ -516,36 +506,26 @@ async def start_new_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_saved_logins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    ensure_session(chat_id)
-
     items = load_saved_logins()
 
     if not items:
         await send_text(
             update,
             "📂 <b>No saved logins found.</b>\n\n"
-            "Press <b>🔐 New Login</b> and choose <b>💾 Save & Login</b> first.",
+            "Pehle <b>🔐 New Login</b> se kisi customer ko save karo.",
             main_keyboard(),
         )
         return
 
-    await close_browser_session(chat_id)
-    ensure_session(chat_id)
-
-    sessions[chat_id]["state"] = STATE_WAITING_SAVED_CHOICE
-
-    await send_text(
-        update,
-        saved_logins_text(delete_mode=False),
-        cancel_keyboard(),
+    await update.effective_message.reply_text(
+        "📂 <b>Saved Logins</b>\n\n"
+        "Customer name par tap karo, login direct start ho jayega 👇",
+        parse_mode=ParseMode.HTML,
+        reply_markup=saved_logins_inline_keyboard(delete_mode=False),
     )
 
 
 async def show_delete_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_chat_id(update)
-    ensure_session(chat_id)
-
     items = load_saved_logins()
 
     if not items:
@@ -556,12 +536,11 @@ async def show_delete_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    sessions[chat_id]["state"] = STATE_WAITING_DELETE_CHOICE
-
-    await send_text(
-        update,
-        saved_logins_text(delete_mode=True),
-        cancel_keyboard(),
+    await update.effective_message.reply_text(
+        "🗑 <b>Delete Saved Login</b>\n\n"
+        "Jise delete karna hai us naam par tap karo 👇",
+        parse_mode=ParseMode.HTML,
+        reply_markup=saved_logins_inline_keyboard(delete_mode=True),
     )
 
 
@@ -581,12 +560,17 @@ async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = get_chat_id(update)
+    ensure_session(chat_id)
     session = sessions[chat_id]
 
     login_id = session.get("login_id")
     password = session.get("password")
 
-    progress_msg = await update.message.reply_text(
+    if not login_id or not password:
+        await send_text(update, "❌ Login ID/password missing. Start again.", main_keyboard())
+        return
+
+    progress_msg = await update.effective_message.reply_text(
         "⚡ Opening Jhatpat portal...\nPlease wait...",
         parse_mode=ParseMode.HTML,
     )
@@ -627,7 +611,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
             error_path = SCREENSHOT_DIR / f"password_tab_error_{chat_id}.png"
             await page.screenshot(path=str(error_path), full_page=True)
 
-            await update.message.reply_photo(
+            await update.effective_message.reply_photo(
                 photo=open(error_path, "rb"),
                 caption="❌ Password Login tab click nahi hua.",
                 reply_markup=main_keyboard(),
@@ -683,7 +667,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         await progress_msg.edit_text("🧩 Captcha ready.", parse_mode=ParseMode.HTML)
 
-        await update.message.reply_photo(
+        await update.effective_message.reply_photo(
             photo=open(captcha_path, "rb"),
             caption=(
                 "🧩 <b>Captcha solve karo</b>\n\n"
@@ -707,7 +691,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
             error_path = SCREENSHOT_DIR / f"open_error_{chat_id}.png"
             if session.get("page"):
                 await session["page"].screenshot(path=str(error_path), full_page=True)
-                await update.message.reply_photo(
+                await update.effective_message.reply_photo(
                     photo=open(error_path, "rb"),
                     caption=f"❌ Error:\n{str(e)}",
                     reply_markup=main_keyboard(),
@@ -726,6 +710,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
 async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT_TYPE, captcha_answer: str):
     chat_id = get_chat_id(update)
+    ensure_session(chat_id)
     session = sessions[chat_id]
     page = session.get("page")
 
@@ -734,7 +719,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
         await send_text(update, "❌ Browser page not found. Start again.", main_keyboard())
         return
 
-    progress_msg = await update.message.reply_text(
+    progress_msg = await update.effective_message.reply_text(
         "🧩 Entering captcha...",
         parse_mode=ParseMode.HTML,
     )
@@ -835,7 +820,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
                 "Agar error dikh raha hai toh captcha/password issue ho sakta hai."
             )
 
-        await update.message.reply_photo(
+        await update.effective_message.reply_photo(
             photo=open(after_login_path, "rb"),
             caption=caption,
             parse_mode=ParseMode.HTML,
@@ -856,7 +841,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
 
                 await progress_msg.edit_text("✅ Login completed.", parse_mode=ParseMode.HTML)
 
-                await update.message.reply_photo(
+                await update.effective_message.reply_photo(
                     photo=open(after_login_path, "rb"),
                     caption="✅ <b>Login successful.</b>\n\nDashboard open ho gaya.",
                     parse_mode=ParseMode.HTML,
@@ -868,7 +853,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
 
             await progress_msg.edit_text("❌ Login error. Screenshot bhej raha hoon.", parse_mode=ParseMode.HTML)
 
-            await update.message.reply_photo(
+            await update.effective_message.reply_photo(
                 photo=open(after_login_path, "rb"),
                 caption=(
                     f"❌ Login error:\n{str(e)}\n\n"
@@ -905,7 +890,7 @@ async def screenshot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = SCREENSHOT_DIR / f"manual_screenshot_{chat_id}.png"
         await page.screenshot(path=str(path), full_page=True)
 
-        await update.message.reply_photo(
+        await update.effective_message.reply_photo(
             photo=open(path, "rb"),
             caption="📸 Current page screenshot.",
             reply_markup=main_keyboard(),
@@ -919,24 +904,102 @@ async def screenshot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---------------- CALLBACK HANDLER ----------------
+
+async def saved_login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.callback_query.answer("Access denied.", show_alert=True)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = get_chat_id(update)
+    ensure_session(chat_id)
+
+    data = query.data or ""
+
+    if data == "saved_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await send_text(update, "Back to main menu.", main_keyboard())
+        return
+
+    if data.startswith("login_saved:"):
+        index_text = data.split(":", 1)[1]
+
+        if not index_text.isdigit():
+            await query.edit_message_text("❌ Invalid saved login.")
+            return
+
+        index = int(index_text)
+        items = load_saved_logins()
+
+        if index < 0 or index >= len(items):
+            await query.edit_message_text("❌ Invalid saved login.")
+            return
+
+        await close_browser_session(chat_id)
+        ensure_session(chat_id)
+
+        item = items[index]
+
+        try:
+            name = item.get("name", "Customer")
+            login_id = item["login_id"]
+            password = decrypt_password(item["password"])
+        except Exception:
+            await query.edit_message_text("❌ Saved login decrypt nahi hua. Delete karke dobara save karo.")
+            return
+
+        sessions[chat_id]["name"] = name
+        sessions[chat_id]["login_id"] = login_id
+        sessions[chat_id]["password"] = password
+        sessions[chat_id]["state"] = STATE_IDLE
+
+        await query.edit_message_text(
+            f"✅ Selected: {name}\nOpening portal now..."
+        )
+
+        await open_site_and_send_captcha(update, context)
+        return
+
+    if data.startswith("delete_saved:"):
+        index_text = data.split(":", 1)[1]
+
+        if not index_text.isdigit():
+            await query.edit_message_text("❌ Invalid saved login.")
+            return
+
+        index = int(index_text)
+        deleted = delete_saved_login_by_index(index)
+
+        if deleted:
+            name = deleted.get("name", "Unknown")
+            await query.edit_message_text(f"🗑 Deleted: {name}")
+            await send_text(update, "Back to main menu.", main_keyboard())
+        else:
+            await query.edit_message_text("❌ Delete failed.")
+        return
+
+
 # ---------------- MESSAGE ROUTER ----------------
 
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.effective_message or not update.effective_message.text:
         return
 
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     chat_id = get_chat_id(update)
     ensure_session(chat_id)
 
-    text = update.message.text.strip()
+    text = update.effective_message.text.strip()
     session = sessions[chat_id]
     state = session.get("state", STATE_IDLE)
 
-    # Buttons
+    # Main buttons
     if text == "🔐 New Login":
         await start_new_login(update, context)
         return
@@ -1083,63 +1146,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Saved login choice
-    if state == STATE_WAITING_SAVED_CHOICE:
-        if not re.fullmatch(r"[0-9]{1,3}", text):
-            await send_text(update, "⚠️ Sirf number bhejo. Example: <code>1</code>", cancel_keyboard())
-            return
-
-        items = load_saved_logins()
-        index = int(text) - 1
-
-        if index < 0 or index >= len(items):
-            await send_text(update, "⚠️ Invalid number. Try again.", cancel_keyboard())
-            return
-
-        item = items[index]
-
-        try:
-            name = item.get("name", "Customer")
-            login_id = item["login_id"]
-            password = decrypt_password(item["password"])
-        except Exception:
-            await send_text(update, "❌ Saved password decrypt nahi hua. Delete karke dobara save karo.", main_keyboard())
-            session["state"] = STATE_IDLE
-            return
-
-        session["name"] = name
-        session["login_id"] = login_id
-        session["password"] = password
-
-        await send_text(
-            update,
-            f"✅ Selected: <b>{html_escape(name)}</b>\n"
-            f"🔑 ID: <code>{mask_text(login_id)}</code>\n\n"
-            "Opening portal now...",
-            cancel_keyboard(),
-        )
-
-        await open_site_and_send_captcha(update, context)
-        return
-
-    # Delete saved choice
-    if state == STATE_WAITING_DELETE_CHOICE:
-        if not re.fullmatch(r"[0-9]{1,3}", text):
-            await send_text(update, "⚠️ Sirf number bhejo. Example: <code>1</code>", cancel_keyboard())
-            return
-
-        index = int(text) - 1
-        ok = delete_saved_login_by_index(index)
-
-        session["state"] = STATE_IDLE
-
-        if ok:
-            await send_text(update, "🗑 <b>Saved login deleted.</b>", main_keyboard())
-        else:
-            await send_text(update, "⚠️ Invalid number.", main_keyboard())
-
-        return
-
     # Captcha
     if state == STATE_WAITING_CAPTCHA:
         captcha_answer = text
@@ -1160,7 +1166,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_text(
         update,
         "👋 Button choose karo 👇\n\n"
-        "Login start karne ke liye <b>🔐 New Login</b> press karo.",
+        "Saved login ke liye <b>📂 Saved Logins</b> press karo.",
         main_keyboard(),
     )
 
@@ -1169,7 +1175,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     chat_id = get_chat_id(update)
@@ -1179,7 +1185,7 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        await update.message.reply_text("⛔ Access denied.")
+        await update.effective_message.reply_text("⛔ Access denied.")
         return
 
     await screenshot_action(update, context)
@@ -1203,6 +1209,13 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("screenshot", screenshot_command))
     app.add_handler(CommandHandler("close", close_command))
+
+    app.add_handler(
+        CallbackQueryHandler(
+            saved_login_callback,
+            pattern=r"^(login_saved:|delete_saved:|saved_cancel$)"
+        )
+    )
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
