@@ -1,7 +1,6 @@
 .env
+secret.key
+saved_logins.json
+screenshots/
 venv/
 __pycache__/
-screenshots/
-*.png
-*.jpg
-*.jpeg
