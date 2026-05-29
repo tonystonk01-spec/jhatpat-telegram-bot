@@ -35,7 +35,6 @@ SITE_URL = "https://jhatpatportal.uppcl.org/"
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-# chat_id wise data
 sessions = {}
 
 STATE_IDLE = "idle"
@@ -59,9 +58,7 @@ def main_keyboard():
 
 def cancel_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("❌ Cancel")],
-        ],
+        [[KeyboardButton("❌ Cancel")]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -143,6 +140,19 @@ async def close_browser_session(chat_id: int):
         "page": None,
         "logged_in": False,
     }
+
+
+async def safe_goto(page, url: str):
+    """
+    Government sites sometimes keep loading forever.
+    So we wait only for commit, then continue after fixed delay.
+    """
+    try:
+        await page.goto(url, wait_until="commit", timeout=120000)
+    except PlaywrightTimeoutError:
+        pass
+
+    await page.wait_for_timeout(6000)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,6 +283,11 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
+                "--no-first-run",
             ],
         )
 
@@ -286,6 +301,8 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
         )
 
         page = await browser_context.new_page()
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(120000)
 
         session["playwright"] = playwright
         session["browser"] = browser
@@ -298,8 +315,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
             parse_mode=ParseMode.HTML,
         )
 
-        await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_timeout(2500)
+        await safe_goto(page, SITE_URL)
 
         await progress_msg.edit_text(
             "🔐 Switching to Password Login...",
@@ -315,7 +331,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         for selector in password_tab_selectors:
             try:
-                await page.locator(selector).first.click(timeout=10000)
+                await page.locator(selector).first.click(timeout=30000)
                 clicked_password_tab = True
                 break
             except Exception:
@@ -333,7 +349,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
             raise RuntimeError("Password Login tab not found/clickable.")
 
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
 
         await progress_msg.edit_text(
             "✍️ Filling login details...",
@@ -350,7 +366,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         for selector in login_selectors:
             try:
-                await page.locator(selector).first.fill(login_id, timeout=7000)
+                await page.locator(selector).first.fill(login_id, timeout=30000)
                 login_filled = True
                 break
             except Exception:
@@ -368,7 +384,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         for selector in password_selectors:
             try:
-                await page.locator(selector).first.fill(password, timeout=7000)
+                await page.locator(selector).first.fill(password, timeout=30000)
                 password_filled = True
                 break
             except Exception:
@@ -377,7 +393,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
         if not password_filled:
             raise RuntimeError("Password field not found.")
 
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1500)
 
         captcha_path = SCREENSHOT_DIR / f"captcha_{chat_id}.png"
         await page.screenshot(path=str(captcha_path), full_page=True)
@@ -409,10 +425,25 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         session["state"] = STATE_IDLE
 
-        await progress_msg.edit_text(
-            f"❌ <b>Error</b>\n\n<code>{str(e)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            error_path = SCREENSHOT_DIR / f"open_error_{chat_id}.png"
+            if session.get("page"):
+                await session["page"].screenshot(path=str(error_path), full_page=True)
+                await update.message.reply_photo(
+                    photo=open(error_path, "rb"),
+                    caption=f"❌ Error:\n{str(e)}",
+                    reply_markup=main_keyboard(),
+                )
+            else:
+                await progress_msg.edit_text(
+                    f"❌ <b>Error</b>\n\n<code>{str(e)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception:
+            await progress_msg.edit_text(
+                f"❌ <b>Error</b>\n\n<code>{str(e)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT_TYPE, captcha_answer: str):
@@ -445,7 +476,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
 
         for selector in captcha_selectors:
             try:
-                await page.locator(selector).first.fill(captcha_answer, timeout=5000)
+                await page.locator(selector).first.fill(captcha_answer, timeout=20000)
                 captcha_filled = True
                 break
             except Exception:
@@ -459,15 +490,14 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
                 try:
                     placeholder = await inputs.nth(i).get_attribute("placeholder")
                     if placeholder and "captcha" in placeholder.lower():
-                        await inputs.nth(i).fill(captcha_answer)
+                        await inputs.nth(i).fill(captcha_answer, timeout=20000)
                         captcha_filled = True
                         break
                 except Exception:
                     pass
 
         if not captcha_filled:
-            # Layout fallback: Login ID, Password, Captcha
-            await page.locator("input").nth(2).fill(captcha_answer)
+            await page.locator("input").nth(2).fill(captcha_answer, timeout=20000)
             captcha_filled = True
 
         await progress_msg.edit_text(
@@ -475,7 +505,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.HTML,
         )
 
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(700)
 
         clicked_login = False
 
@@ -488,7 +518,7 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
 
         for selector in login_button_selectors:
             try:
-                await page.locator(selector).first.click(timeout=10000)
+                await page.locator(selector).first.click(timeout=30000)
                 clicked_login = True
                 break
             except Exception:
@@ -503,19 +533,17 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
         )
 
         try:
-            await page.wait_for_load_state("networkidle", timeout=25000)
+            await page.wait_for_load_state("domcontentloaded", timeout=45000)
         except PlaywrightTimeoutError:
             pass
 
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(8000)
 
         after_login_path = SCREENSHOT_DIR / f"after_login_{chat_id}.png"
         await page.screenshot(path=str(after_login_path), full_page=True)
 
         session["state"] = STATE_IDLE
         session["logged_in"] = True
-
-        # password memory clear after login
         session["password"] = None
 
         await progress_msg.edit_text(
@@ -611,7 +639,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = sessions[chat_id]
     state = session.get("state", STATE_IDLE)
 
-    # Buttons
     if text == "🔐 New Login":
         await start_new_login(update, context)
         return
@@ -642,7 +669,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_flow(update, context)
         return
 
-    # State handling
     if state == STATE_WAITING_LOGIN_ID:
         login_id = text
 
@@ -706,7 +732,6 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await submit_captcha_and_login(update, context, captcha_answer)
         return
 
-    # Idle unknown text
     await send_text(
         update,
         "👋 Button choose karo 👇\n\n"
@@ -751,14 +776,12 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands still available, but papa can ignore them.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("screenshot", screenshot_command))
     app.add_handler(CommandHandler("close", close_command))
 
-    # Main button/text router
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
     app.add_error_handler(error_handler)
