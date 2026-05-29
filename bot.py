@@ -103,8 +103,10 @@ def ensure_session(chat_id: int):
     if chat_id not in sessions:
         sessions[chat_id] = {
             "state": STATE_IDLE,
+            "name": None,
             "login_id": None,
             "password": None,
+            "pending_name": None,
             "pending_login_id": None,
             "pending_password": None,
             "playwright": None,
@@ -139,6 +141,26 @@ async def send_text(update: Update, text: str, keyboard=None):
         disable_web_page_preview=True,
         reply_markup=keyboard or main_keyboard(),
     )
+
+
+def parse_name_id_password(text: str):
+    """
+    Format:
+    Ramesh ji 7302405466 password123
+
+    Last 2 parts are login_id and password.
+    Everything before that is name.
+    """
+    parts = text.strip().split()
+
+    if len(parts) < 3:
+        return None, None, None
+
+    password = parts[-1].strip()
+    login_id = parts[-2].strip()
+    name = " ".join(parts[:-2]).strip()
+
+    return name, login_id, password
 
 
 # ---------------- ENCRYPTED SAVED LOGINS ----------------
@@ -177,21 +199,22 @@ def decrypt_password(token: str) -> str:
     return get_cipher().decrypt(token.encode()).decode()
 
 
-def add_saved_login(login_id: str, password: str):
+def add_saved_login(name: str, login_id: str, password: str):
     items = load_saved_logins()
 
-    # Same login ID already saved hai toh update password
+    # Same login ID already saved hai toh update
     for item in items:
         if item.get("login_id") == login_id:
+            item["name"] = name
+            item["login_id"] = login_id
             item["password"] = encrypt_password(password)
-            item["label"] = mask_text(login_id)
             save_saved_logins(items)
             return
 
     items.append(
         {
             "id": str(uuid.uuid4()),
-            "label": mask_text(login_id),
+            "name": name,
             "login_id": login_id,
             "password": encrypt_password(password),
         }
@@ -209,17 +232,29 @@ def delete_saved_login_by_index(index: int) -> bool:
     return True
 
 
-def saved_logins_text() -> str:
+def saved_logins_text(delete_mode=False) -> str:
     items = load_saved_logins()
 
     if not items:
         return "📂 <b>No saved logins found.</b>"
 
-    lines = ["📂 <b>Saved Logins</b>\n"]
-    for i, item in enumerate(items, start=1):
-        lines.append(f"{i}. <code>{html_escape(item.get('label', 'Unknown'))}</code>")
+    if delete_mode:
+        lines = ["🗑 <b>Delete Saved Login</b>\n"]
+    else:
+        lines = ["📂 <b>Saved Logins</b>\n"]
 
-    lines.append("\nSend number to select.")
+    for i, item in enumerate(items, start=1):
+        name = item.get("name", "Unknown")
+        login_id = item.get("login_id", "")
+        lines.append(
+            f"{i}. <b>{html_escape(name)}</b>  —  <code>{mask_text(login_id)}</code>"
+        )
+
+    if delete_mode:
+        lines.append("\nSend number to delete.")
+    else:
+        lines.append("\nSend number to login.")
+
     lines.append("Example: <code>1</code>")
 
     return "\n".join(lines)
@@ -253,8 +288,10 @@ async def close_browser_session(chat_id: int):
 
     sessions[chat_id] = {
         "state": STATE_IDLE,
+        "name": None,
         "login_id": None,
         "password": None,
+        "pending_name": None,
         "pending_login_id": None,
         "pending_password": None,
         "playwright": None,
@@ -325,6 +362,48 @@ async def launch_browser_and_page():
     return playwright, browser, browser_context, page
 
 
+async def take_captcha_crop(page, chat_id: int) -> Path:
+    """
+    Full page ki jagah sirf captcha area crop karta hai.
+    Agar crop fail ho toh full screenshot fallback.
+    """
+    captcha_path = SCREENSHOT_DIR / f"captcha_{chat_id}.png"
+
+    captcha_box = None
+
+    captcha_selectors = [
+        "input[placeholder*='captcha']",
+        "input[placeholder*='Captcha']",
+        "input[placeholder*='CAPTCHA']",
+    ]
+
+    for selector in captcha_selectors:
+        try:
+            captcha_input = page.locator(selector).first
+            box = await captcha_input.bounding_box(timeout=5000)
+
+            if box:
+                captcha_box = {
+                    "x": max(box["x"] - 50, 0),
+                    "y": max(box["y"] - 135, 0),
+                    "width": max(box["width"] + 160, 340),
+                    "height": 210,
+                }
+                break
+        except Exception:
+            pass
+
+    if captcha_box:
+        try:
+            await page.screenshot(path=str(captcha_path), clip=captcha_box)
+            return captcha_path
+        except Exception:
+            pass
+
+    await page.screenshot(path=str(captcha_path), full_page=True)
+    return captcha_path
+
+
 # ---------------- COMMANDS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,8 +418,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "⚡ <b>Jhatpat Bot Ready</b>\n\n"
         "Button choose karo 👇\n\n"
-        "🔐 <b>New Login</b> - new ID/password se login\n"
-        "📂 <b>Saved Logins</b> - saved ID se login\n"
+        "🔐 <b>New Login</b> - new customer login\n"
+        "📂 <b>Saved Logins</b> - saved customer se login\n"
         "📸 <b>Screenshot</b> - current page image\n"
         "🗑 <b>Delete Saved</b> - saved login remove\n"
         "🛑 <b>Close Session</b> - browser close",
@@ -358,15 +437,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❔ <b>Help</b>\n\n"
         "New login flow:\n"
         "1️⃣ Press <b>🔐 New Login</b>\n"
-        "2️⃣ Send Login ID and Password in one message\n"
+        "2️⃣ Send <b>Name LoginID Password</b> in one message\n\n"
         "Example:\n"
-        "<code>7302405466 mypassword</code>\n\n"
+        "<code>Ramesh ji 7302405466 mypassword</code>\n\n"
         "3️⃣ Choose <b>🚀 Login Once</b> or <b>💾 Save & Login</b>\n"
-        "4️⃣ Captcha screenshot aayega\n"
-        "5️⃣ Captcha number bhej do\n\n"
+        "4️⃣ Bot sirf captcha image bhejega\n"
+        "5️⃣ Captcha answer bhej do\n\n"
         "Saved login flow:\n"
         "1️⃣ Press <b>📂 Saved Logins</b>\n"
-        "2️⃣ Number select karo\n"
+        "2️⃣ Name ke saamne number select karo\n"
         "3️⃣ Captcha solve karo",
         main_keyboard(),
     )
@@ -383,10 +462,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = session.get("state", STATE_IDLE)
     logged_in = session.get("logged_in", False)
+    name = session.get("name")
     login_id = session.get("login_id")
 
     if state == STATE_WAITING_CREDENTIALS:
-        state_text = "Waiting for ID + Password"
+        state_text = "Waiting for Name + ID + Password"
     elif state == STATE_WAITING_SAVE_CHOICE:
         state_text = "Waiting for Save/Login choice"
     elif state == STATE_WAITING_SAVED_CHOICE:
@@ -405,7 +485,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_text(
         update,
         "📊 <b>Bot Status</b>\n\n"
-        f"👤 Current Login ID: <code>{mask_text(login_id)}</code>\n"
+        f"👤 Name: <b>{html_escape(name or 'N/A')}</b>\n"
+        f"🔑 Login ID: <code>{mask_text(login_id)}</code>\n"
         f"💾 Saved Logins: <b>{saved_count}</b>\n"
         f"🟢 State: <b>{state_text}</b>",
         main_keyboard(),
@@ -426,9 +507,10 @@ async def start_new_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_text(
         update,
         "🔐 <b>New Login Started</b>\n\n"
-        "Please send <b>Login ID and Password</b> in one message.\n\n"
+        "Please send <b>Name LoginID Password</b> in one message.\n\n"
         "Example:\n"
-        "<code>7302405466 mypassword</code>",
+        "<code>Ramesh ji 7302405466 mypassword</code>\n\n"
+        "Note: Last 2 words should be Login ID and Password.",
         cancel_keyboard(),
     )
 
@@ -455,7 +537,7 @@ async def show_saved_logins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_text(
         update,
-        saved_logins_text(),
+        saved_logins_text(delete_mode=False),
         cancel_keyboard(),
     )
 
@@ -476,10 +558,11 @@ async def show_delete_saved(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sessions[chat_id]["state"] = STATE_WAITING_DELETE_CHOICE
 
-    text = saved_logins_text().replace("📂 <b>Saved Logins</b>", "🗑 <b>Delete Saved Login</b>")
-    text = text.replace("Send number to select.", "Send number to delete.")
-
-    await send_text(update, text, cancel_keyboard())
+    await send_text(
+        update,
+        saved_logins_text(delete_mode=True),
+        cancel_keyboard(),
+    )
 
 
 async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -594,8 +677,7 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
 
         await page.wait_for_timeout(1200)
 
-        captcha_path = SCREENSHOT_DIR / f"captcha_{chat_id}.png"
-        await page.screenshot(path=str(captcha_path), full_page=True)
+        captcha_path = await take_captcha_crop(page, chat_id)
 
         session["state"] = STATE_WAITING_CAPTCHA
 
@@ -604,9 +686,9 @@ async def open_site_and_send_captcha(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_photo(
             photo=open(captcha_path, "rb"),
             caption=(
-                "🧩 <b>Please enter solved captcha...</b>\n\n"
-                "Example: <code>8</code>\n\n"
-                "Sirf number bhejna hai."
+                "🧩 <b>Captcha solve karo</b>\n\n"
+                "Sirf answer bhejna hai.\n"
+                "Example: <code>16</code>"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=cancel_keyboard(),
@@ -734,17 +816,21 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
         session["password"] = None
         session["pending_password"] = None
 
+        name = session.get("name") or "Customer"
+
         if dashboard_ok:
             await progress_msg.edit_text("✅ Login completed.", parse_mode=ParseMode.HTML)
             caption = (
-                "✅ <b>Login successful.</b>\n\n"
+                f"✅ <b>Login successful.</b>\n\n"
+                f"👤 <b>{html_escape(name)}</b>\n\n"
                 "📸 Screenshot button se current page dekh sakte ho.\n"
                 "🛑 Close Session se browser close kar sakte ho."
             )
         else:
             await progress_msg.edit_text("⚠️ Screenshot ready.", parse_mode=ParseMode.HTML)
             caption = (
-                "⚠️ <b>Login ke baad page screenshot.</b>\n\n"
+                f"⚠️ <b>Login ke baad page screenshot.</b>\n\n"
+                f"👤 <b>{html_escape(name)}</b>\n\n"
                 "Agar dashboard dikh raha hai toh login successful hai.\n"
                 "Agar error dikh raha hai toh captcha/password issue ho sakta hai."
             )
@@ -757,7 +843,6 @@ async def submit_captcha_and_login(update: Update, context: ContextTypes.DEFAULT
         )
 
     except Exception as e:
-        # False error avoid: error ke baad bhi screenshot leke dashboard check karte hain
         try:
             after_login_path = SCREENSHOT_DIR / f"after_login_errorcheck_{chat_id}.png"
             await page.screenshot(path=str(after_login_path), full_page=True)
@@ -885,30 +970,38 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel_flow(update, context)
         return
 
-    # Waiting for one-message credentials
+    # Waiting for Name + ID + Password
     if state == STATE_WAITING_CREDENTIALS:
-        parts = text.split(maxsplit=1)
+        name, login_id, password = parse_name_id_password(text)
 
-        if len(parts) < 2:
+        if not name or not login_id or not password:
             await send_text(
                 update,
                 "⚠️ Format galat hai.\n\n"
-                "Login ID aur Password ek hi message me bhejo.\n\n"
+                "Name, Login ID aur Password ek hi message me bhejo.\n\n"
                 "Example:\n"
-                "<code>7302405466 mypassword</code>",
+                "<code>Ramesh ji 7302405466 mypassword</code>\n\n"
+                "Last 2 words should be Login ID and Password.",
                 cancel_keyboard(),
             )
             return
 
-        login_id = parts[0].strip()
-        password = parts[1].strip()
+        if len(name) < 2:
+            await send_text(
+                update,
+                "⚠️ Name too short lag raha hai.\n\n"
+                "Example:\n"
+                "<code>Ramesh ji 7302405466 mypassword</code>",
+                cancel_keyboard(),
+            )
+            return
 
         if len(login_id) < 5:
             await send_text(
                 update,
                 "⚠️ Login ID / Mobile Number too short lag raha hai.\n\n"
                 "Example:\n"
-                "<code>7302405466 mypassword</code>",
+                "<code>Ramesh ji 7302405466 mypassword</code>",
                 cancel_keyboard(),
             )
             return
@@ -918,11 +1011,12 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update,
                 "⚠️ Password too short lag raha hai.\n\n"
                 "Example:\n"
-                "<code>7302405466 mypassword</code>",
+                "<code>Ramesh ji 7302405466 mypassword</code>",
                 cancel_keyboard(),
             )
             return
 
+        session["pending_name"] = name
         session["pending_login_id"] = login_id
         session["pending_password"] = password
         session["state"] = STATE_WAITING_SAVE_CHOICE
@@ -930,7 +1024,8 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_text(
             update,
             "✅ <b>Login details received.</b>\n\n"
-            f"👤 Login ID: <code>{mask_text(login_id)}</code>\n\n"
+            f"👤 Name: <b>{html_escape(name)}</b>\n"
+            f"🔑 Login ID: <code>{mask_text(login_id)}</code>\n\n"
             "Choose option:",
             save_choice_keyboard(),
         )
@@ -938,23 +1033,26 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Save/Login choice
     if state == STATE_WAITING_SAVE_CHOICE:
+        name = session.get("pending_name")
         login_id = session.get("pending_login_id")
         password = session.get("pending_password")
 
-        if not login_id or not password:
+        if not name or not login_id or not password:
             session["state"] = STATE_IDLE
             await send_text(update, "❌ Details missing. Start again.", main_keyboard())
             return
 
         if text == "💾 Save & Login":
-            add_saved_login(login_id, password)
+            add_saved_login(name, login_id, password)
 
+            session["name"] = name
             session["login_id"] = login_id
             session["password"] = password
 
             await send_text(
                 update,
                 "💾 <b>Saved.</b>\n\n"
+                f"👤 <b>{html_escape(name)}</b>\n\n"
                 "Opening portal now...",
                 cancel_keyboard(),
             )
@@ -963,6 +1061,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "🚀 Login Once":
+            session["name"] = name
             session["login_id"] = login_id
             session["password"] = password
 
@@ -1000,6 +1099,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = items[index]
 
         try:
+            name = item.get("name", "Customer")
             login_id = item["login_id"]
             password = decrypt_password(item["password"])
         except Exception:
@@ -1007,12 +1107,14 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session["state"] = STATE_IDLE
             return
 
+        session["name"] = name
         session["login_id"] = login_id
         session["password"] = password
 
         await send_text(
             update,
-            f"✅ Selected: <code>{mask_text(login_id)}</code>\n\n"
+            f"✅ Selected: <b>{html_escape(name)}</b>\n"
+            f"🔑 ID: <code>{mask_text(login_id)}</code>\n\n"
             "Opening portal now...",
             cancel_keyboard(),
         )
@@ -1047,7 +1149,7 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update,
                 "⚠️ Captcha invalid lag raha hai.\n\n"
                 "Sirf number bhejo.\n"
-                "Example: <code>8</code>",
+                "Example: <code>16</code>",
                 cancel_keyboard(),
             )
             return
